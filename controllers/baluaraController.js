@@ -1,130 +1,159 @@
-import path from 'path';
-import fs from 'fs';
 import pool from "../models/db.js";
+import { v2 as cloudinary } from "cloudinary";
 
-// Folder untuk gambar baluara
-const folderPath = path.resolve('public/uploads/baluara');
-
-// Get all Baluara
+// ✅ Ambil semua data baluara
 export const getAllBaluara = async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM baluara ORDER BY id DESC");
+    const result = await pool.query(`
+      SELECT id, nama, deskripsi, deskripsi_en, gambar, lat, lng 
+      FROM baluara ORDER BY id DESC
+    `);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 };
 
-// Get Baluara by ID
+// ✅ Ambil detail baluara by ID + terjemahan deskripsi
 export const getBaluaraById = async (req, res) => {
   const { id } = req.params;
-  const lang = req.query.lang || 'id';
-  const selectDeskripsi = lang === 'en' ? 'deskripsi_en' : 'deskripsi';
+  const lang = req.query.lang || "id";
+  const selectDeskripsi = lang === "en" ? "deskripsi_en" : "deskripsi";
 
   try {
     const result = await pool.query(
-      `SELECT id, nama, ${selectDeskripsi} AS deskripsi, gambar, lat, lng FROM baluara WHERE id = $1`,
+      `SELECT id, nama, ${selectDeskripsi} AS deskripsi, gambar, lat, lng 
+       FROM baluara WHERE id = $1`,
       [id]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Data tidak ditemukan' });
+      return res.status(404).json({ message: "Data tidak ditemukan" });
     }
 
     res.json(result.rows[0]);
   } catch (err) {
     console.error("Gagal fetch detail baluara:", err);
-    res.status(500).json({ error: 'Gagal mengambil data detail' });
+    res.status(500).json({ error: "Gagal mengambil data detail" });
   }
 };
 
-
-// Create Baluara
+// ✅ Tambah baluara (upload gambar ke Cloudinary)
 export const createBaluara = async (req, res) => {
   const { nama, deskripsi, deskripsi_en, lat, lng } = req.body;
-  const gambar = req.file?.filename;
 
-  if (!gambar) return res.status(400).json({ error: "File gambar wajib diupload." });
+  if (!req.file) {
+    return res.status(400).json({ error: "File gambar wajib diupload." });
+  }
 
   try {
+    const uploadResult = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { folder: "baluara" },
+        (err, result) => {
+          if (err) reject(err);
+          else resolve(result);
+        }
+      );
+      stream.end(req.file.buffer);
+    });
+
+    const { secure_url, public_id } = uploadResult;
+
     const result = await pool.query(
-      `INSERT INTO baluara (nama, deskripsi, deskripsi_en, gambar, lat, lng)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [nama, deskripsi, deskripsi_en || '', gambar, lat, lng]
+      `INSERT INTO baluara 
+        (nama, deskripsi, deskripsi_en, gambar, public_id, lat, lng)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, nama, deskripsi, deskripsi_en, gambar, lat, lng`,
+      [nama, deskripsi, deskripsi_en || "", secure_url, public_id, lat, lng]
     );
+
     res.json(result.rows[0]);
   } catch (err) {
+    console.error("Gagal tambah baluara:", err);
     res.status(500).json({ error: err.message });
   }
 };
 
-// Update Baluara
+// ✅ Update baluara (hapus gambar lama jika ada)
 export const updateBaluara = async (req, res) => {
   const { id } = req.params;
   const { nama, deskripsi, deskripsi_en, lat, lng } = req.body;
-  const gambarBaru = req.file?.filename;
 
   try {
-    const oldResult = await pool.query("SELECT gambar FROM baluara WHERE id = $1", [id]);
+    const oldResult = await pool.query("SELECT * FROM baluara WHERE id = $1", [id]);
     if (oldResult.rows.length === 0) {
       return res.status(404).json({ error: "Data tidak ditemukan." });
     }
 
-    const oldImage = oldResult.rows[0].gambar;
+    const dataLama = oldResult.rows[0];
+    let finalImage = dataLama.gambar;
+    let finalPublicId = dataLama.public_id;
 
-    let updateQuery = `
-      UPDATE baluara SET nama = $1, deskripsi = $2, deskripsi_en = $3, lat = $4, lng = $5`;
-    let values = [nama, deskripsi, deskripsi_en || '', lat, lng];
+    if (req.file) {
+      if (dataLama.public_id) {
+        await cloudinary.uploader.destroy(dataLama.public_id);
+      }
 
-    if (gambarBaru) {
-      updateQuery += `, gambar = $6 WHERE id = $7 RETURNING *`;
-      values.push(gambarBaru, id);
-    } else {
-      updateQuery += ` WHERE id = $6 RETURNING *`;
-      values.push(id);
-    }
-
-    const result = await pool.query(updateQuery, values);
-
-    // Hapus gambar lama jika ada gambar baru
-    if (gambarBaru && oldImage) {
-      const pathLama = path.join(folderPath, oldImage);
-      fs.access(pathLama, fs.constants.F_OK, (err) => {
-        if (!err) {
-          fs.unlink(pathLama, (err) => {
-            if (err) console.error("Gagal hapus gambar lama:", err);
-          });
-        }
+      const uploadResult = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: "baluara" },
+          (err, result) => {
+            if (err) reject(err);
+            else resolve(result);
+          }
+        );
+        stream.end(req.file.buffer);
       });
+
+      finalImage = uploadResult.secure_url;
+      finalPublicId = uploadResult.public_id;
     }
 
-    res.json(result.rows[0]);
+    const updateResult = await pool.query(
+      `UPDATE baluara 
+       SET nama = $1, deskripsi = $2, deskripsi_en = $3, gambar = $4, public_id = $5, lat = $6, lng = $7
+       WHERE id = $8
+       RETURNING id, nama, deskripsi, deskripsi_en, gambar, lat, lng`,
+      [
+        nama,
+        deskripsi,
+        deskripsi_en || "",
+        finalImage,
+        finalPublicId,
+        lat,
+        lng,
+        id,
+      ]
+    );
+
+    res.json(updateResult.rows[0]);
   } catch (err) {
+    console.error("Gagal update baluara:", err);
     res.status(500).json({ error: err.message });
   }
 };
 
-// Delete Baluara
+// ✅ Hapus baluara + hapus gambar dari Cloudinary
 export const deleteBaluara = async (req, res) => {
   const { id } = req.params;
 
   try {
-    const result = await pool.query("SELECT gambar FROM baluara WHERE id = $1", [id]);
-    const gambar = result.rows[0]?.gambar;
+    const result = await pool.query(
+      "SELECT public_id FROM baluara WHERE id = $1",
+      [id]
+    );
+    const public_id = result.rows[0]?.public_id;
 
     await pool.query("DELETE FROM baluara WHERE id = $1", [id]);
 
-    if (gambar) {
-      const pathFile = path.join(folderPath, gambar);
-      fs.unlink(pathFile, (err) => {
-        if (err && err.code !== "ENOENT") {
-          console.error("Gagal hapus gambar:", err);
-        }
-      });
+    if (public_id) {
+      await cloudinary.uploader.destroy(public_id);
     }
 
     res.json({ message: "Baluara berhasil dihapus." });
   } catch (err) {
+    console.error("Gagal hapus baluara:", err);
     res.status(500).json({ error: err.message });
   }
 };

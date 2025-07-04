@@ -1,8 +1,7 @@
-import path from 'path';
-import fs from 'fs';
-import pool from '../models/db.js';
+import pool from "../models/db.js";
+import { v2 as cloudinary } from "cloudinary";
 
-// Get all wisata
+// ✅ Get all Wisata
 export const getAllWisata = async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM wisata ORDER BY id DESC");
@@ -12,89 +11,118 @@ export const getAllWisata = async (req, res) => {
   }
 };
 
-
-// Get Wisata by ID
+// ✅ Get Wisata by ID (multi-bahasa)
 export const getWisataById = async (req, res) => {
   const { id } = req.params;
-  const lang = req.query.lang || 'id';
-  const selectDeskripsi = lang === 'en' ? 'deskripsi_en' : 'deskripsi';
+  const lang = req.query.lang || "id";
+  const deskripsiField = lang === "en" ? "deskripsi_en" : "deskripsi";
 
   try {
-    const query = `
-      SELECT id, nama, ${selectDeskripsi} AS deskripsi, gambar, lat, lng
-      FROM wisata
-      WHERE id = $1
-    `;
-    const result = await pool.query(query, [id]);
+    const result = await pool.query(
+      `SELECT id, nama, ${deskripsiField} AS deskripsi, gambar, lat, lng FROM wisata WHERE id = $1`,
+      [id]
+    );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Data tidak ditemukan' });
+      return res.status(404).json({ message: "Data tidak ditemukan" });
     }
 
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Gagal fetch detail wisata:', err);
-    res.status(500).json({ error: 'Gagal mengambil data detail' });
+    res.status(500).json({ error: "Gagal mengambil data detail" });
   }
 };
 
-// Create wisata
+// ✅ Create Wisata
 export const createWisata = async (req, res) => {
   const { nama, deskripsi, deskripsi_en, lat, lng } = req.body;
-  const gambar = req.file?.filename;
 
-  if (!gambar) return res.status(400).json({ error: 'File gambar wajib diupload.' });
+  if (!req.file) {
+    return res.status(400).json({ error: "File gambar wajib diupload." });
+  }
 
   try {
+    const uploadResult = await new Promise((resolve, reject) => {
+      cloudinary.uploader
+        .upload_stream({ folder: "wisata" }, (err, result) => {
+          if (err) reject(err);
+          else resolve(result);
+        })
+        .end(req.file.buffer);
+    });
+
+    const { secure_url, public_id } = uploadResult;
+
     const result = await pool.query(
-      `INSERT INTO wisata (nama, deskripsi, deskripsi_en, gambar, lat, lng)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [nama, deskripsi, deskripsi_en, gambar, lat, lng]
+      `INSERT INTO wisata (nama, deskripsi, deskripsi_en, gambar, public_id, lat, lng)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [
+        nama,
+        deskripsi,
+        deskripsi_en || "",
+        secure_url,
+        public_id,
+        lat,
+        lng,
+      ]
     );
 
     res.json(result.rows[0]);
   } catch (err) {
+    console.error("Gagal tambah wisata:", err);
     res.status(500).json({ error: err.message });
   }
 };
 
-// Update wisata
+// ✅ Update Wisata
 export const updateWisata = async (req, res) => {
   const { id } = req.params;
   const { nama, deskripsi, deskripsi_en, lat, lng } = req.body;
-  const fileBaru = req.file?.filename;
 
   try {
-    const result = await pool.query('SELECT * FROM wisata WHERE id = $1', [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Data tidak ditemukan' });
+    const oldResult = await pool.query("SELECT * FROM wisata WHERE id = $1", [
+      id,
+    ]);
+    if (oldResult.rows.length === 0) {
+      return res.status(404).json({ error: "Data tidak ditemukan." });
     }
 
-    const wisataLama = result.rows[0];
-    const gambarLama = wisataLama.gambar;
+    const wisataLama = oldResult.rows[0];
+    let finalImage = wisataLama.gambar;
+    let finalPublicId = wisataLama.public_id;
 
-    // Hapus gambar lama jika ada file baru
-    if (fileBaru && gambarLama) {
-      const filePath = path.resolve('public/uploads/wisata', gambarLama);
-      fs.access(filePath, fs.constants.F_OK, (err) => {
-        if (!err) {
-          fs.unlink(filePath, (err) => {
-            if (err) console.error('Gagal hapus gambar lama:', err);
-          });
-        } else {
-          console.warn(`⚠️ File lama tidak ditemukan: ${filePath}`);
-        }
+    if (req.file) {
+      if (wisataLama.public_id) {
+        await cloudinary.uploader.destroy(wisataLama.public_id);
+      }
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        cloudinary.uploader
+          .upload_stream({ folder: "wisata" }, (err, result) => {
+            if (err) reject(err);
+            else resolve(result);
+          })
+          .end(req.file.buffer);
       });
-    }
 
-    const gambarAkhir = fileBaru || gambarLama;
+      finalImage = uploadResult.secure_url;
+      finalPublicId = uploadResult.public_id;
+    }
 
     const updateResult = await pool.query(
-      `UPDATE wisata 
-       SET nama = $1, deskripsi = $2, deskripsi_en = $3, gambar = $4, lat = $5, lng = $6 
-       WHERE id = $7 
-       RETURNING *`,
-      [nama, deskripsi, deskripsi_en, gambarAkhir, lat, lng, id]
+      `UPDATE wisata
+       SET nama = $1, deskripsi = $2, deskripsi_en = $3, gambar = $4, public_id = $5, lat = $6, lng = $7
+       WHERE id = $8 RETURNING *`,
+      [
+        nama,
+        deskripsi,
+        deskripsi_en || "",
+        finalImage,
+        finalPublicId,
+        lat,
+        lng,
+        id,
+      ]
     );
 
     res.json(updateResult.rows[0]);
@@ -104,25 +132,26 @@ export const updateWisata = async (req, res) => {
   }
 };
 
-// Delete wisata
+// ✅ Delete Wisata
 export const deleteWisata = async (req, res) => {
   const { id } = req.params;
 
   try {
-    const result = await pool.query('SELECT gambar FROM wisata WHERE id = $1', [id]);
-    const gambar = result.rows[0]?.gambar;
+    const result = await pool.query(
+      "SELECT public_id FROM wisata WHERE id = $1",
+      [id]
+    );
+    const public_id = result.rows[0]?.public_id;
 
-    await pool.query('DELETE FROM wisata WHERE id = $1', [id]);
+    await pool.query("DELETE FROM wisata WHERE id = $1", [id]);
 
-    if (gambar) {
-      const filePath = path.resolve('public/uploads/wisata', gambar);
-      fs.unlink(filePath, (err) => {
-        if (err) console.error('Gagal hapus gambar:', err);
-      });
+    if (public_id) {
+      await cloudinary.uploader.destroy(public_id);
     }
 
-    res.json({ message: 'Wisata berhasil dihapus.' });
+    res.json({ message: "Wisata berhasil dihapus." });
   } catch (err) {
+    console.error("Gagal hapus wisata:", err);
     res.status(500).json({ error: err.message });
   }
 };
